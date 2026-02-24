@@ -179,22 +179,53 @@ function analyze(d1, d2) {
   const causeB = su.filter(r => r.payDate.startsWith(TARGET) && r.trtDate && !r.trtDate.startsWith(TARGET) && r.sys > 0);
 
   // 3. C: 타겟 월 진료 후 매출은 잡혔으나, 수납 내역(현금/카드 등)이 없는 경우 (주로 선납금 결제 또는 미수)
-  //    조건: 진료일은 타겟 월임 && 매출 > 0 && (접수번호 매칭 실패)
-  //    매칭 키: 접수번호 우선, 없으면 이름+진료일
-  const suKeys = new Set();
-  su.forEach(r => {
-    if (r.payDate.startsWith(TARGET)) {
-      if (r.id) suKeys.add(r.id);
-      suKeys.add(`${r.nm}_${r.trtDate}`);
-    }
+  //    금액 차이 기반으로 로직 변경: 매출액 != 수납액인 경우 모두 추출 (부분수납 포함)
+  
+  // (1) 당월 진료건들의 총 매출액 집계
+  const maMap = {};
+  ma.forEach(r => {
+    if (!r.trtDate.startsWith(TARGET)) return;
+    const key = r.id || `${r.nm}_${r.trtDate}`; // ID 우선, 없으면 이름+진료일
+    maMap[key] = (maMap[key] || 0) + r.amt;
   });
 
-  const causeC = ma.filter(r => {
-    if (!r.trtDate.startsWith(TARGET) || r.amt <= 0) return false;
-    // 수납 내역에 있는지 확인
-    if (r.id && suKeys.has(r.id)) return false;
-    if (suKeys.has(`${r.nm}_${r.trtDate}`)) return false;
-    return true;
+  // (2) 당월 진료건에 대해 당월에 수납된 총액 집계
+  const suMap = {};
+  su.forEach(r => {
+    if (!r.payDate.startsWith(TARGET)) return; // 수납일 기준 타겟월
+    // 진료일이 없거나 타겟월이 아니면 원인B(이전달 진료) 등이므로 제외
+    if (!r.trtDate || !r.trtDate.startsWith(TARGET)) return; 
+    
+    const key = r.id || `${r.nm}_${r.trtDate}`;
+    suMap[key] = (suMap[key] || 0) + r.sys;
+  });
+
+  // (3) 차액 발생 건 분류
+  const causeC = [];
+  const processedKeys = new Set(); // 중복 방지용
+
+  // 매출 리스트를 순회하며 차액 확인
+  ma.forEach(r => {
+    if (!r.trtDate.startsWith(TARGET)) return;
+    const key = r.id || `${r.nm}_${r.trtDate}`;
+    
+    if (processedKeys.has(key)) return; // 이미 처리한 환자(키)면 패스
+    processedKeys.add(key);
+
+    const totalAmt = maMap[key] || 0;
+    const totalPaid = suMap[key] || 0;
+    const diffVal = totalAmt - totalPaid; // 미수납액 (양수면 덜 낸 것)
+
+    // 10원 단위 이상 차이가 날 때만 잡기
+    if (Math.abs(diffVal) > 0) {
+       causeC.push({
+         ...r, // 기본 정보 (이름 등)
+         amt: totalAmt, // 총 매출액 업데이트 (합산된 값으로)
+         paid: totalPaid, // 수납액 추가
+         diffAmt: diffVal, // 차액 (원인 C 금액)
+         isPartial: totalPaid > 0 // 부분 수납 여부
+       });
+    }
   });
 
   // 선납금 사용 내역 매핑 (원인 C 상세 분석용)
@@ -208,7 +239,7 @@ function analyze(d1, d2) {
 
   const amtA = causeA.reduce((s, r) => s + r.sys, 0);
   const amtB = causeB.reduce((s, r) => s + r.sys, 0);
-  const amtC = causeC.reduce((s, r) => s + r.amt, 0);
+  const amtC = causeC.reduce((s, r) => s + r.diffAmt, 0); // diffAmt 사용
   const residual = diff - (amtA + amtB - amtC);
 
   return { totalSu, totalMa, diff, TARGET, causeA, causeB, causeC, prepayMap, amtA, amtB, amtC, residual };
@@ -287,6 +318,21 @@ function tblB(data) {
     data.map(r => `<tr><td>${r.nm}</td><td>${r.payDate}</td><td>${won(r.sys)}</td></tr>`).join('') + `</tbody></table></div>`;
 }
 function tblC(data, pm) {
-  return `<div class="tbl-wrap"><table><thead><tr><th>환자명</th><th>매출액</th><th>비고</th></tr></thead><tbody>` + 
-    data.map(r => `<tr><td>${r.nm}</td><td>${won(r.amt)}</td><td>${pm[r.nm]?'선납사용':'미수'}</td></tr>`).join('') + `</tbody></table></div>`;
+  return `<div class="tbl-wrap"><table><thead><tr><th>환자명</th><th>매출액</th><th>수납액</th><th>미수납액</th><th>비고</th></tr></thead><tbody>` + 
+    data.map(r => {
+       const pre = pm[r.nm] || 0;
+       const note = [];
+       if (pre > 0) note.push(`선납사용(${won(pre)})`);
+       if (r.isPartial) note.push('부분수납');
+       if (!r.isPartial && pre === 0) note.push('전액미수');
+       if (!r.isPartial && pre > 0 && r.diffAmt <= 0) note.push('선납완납'); // 선납으로 전액 결제 시
+       
+       return `<tr>
+         <td>${r.nm}</td>
+         <td>${won(r.amt)}</td>
+         <td>${won(r.paid)}</td>
+         <td class="n-org">${won(r.diffAmt)}</td>
+         <td>${note.join(', ')}</td>
+       </tr>`;
+    }).join('') + `</tbody></table></div>`;
 }
